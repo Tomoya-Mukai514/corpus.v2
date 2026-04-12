@@ -1,14 +1,14 @@
 openapi: 3.1.0
 info:
-  title: J-STAGE Proxy Starter
+  title: J-Stage Search Proxy
   version: 1.0.0
 servers:
-  - url: https://YOUR-RENDER-URL.onrender.com
+  - url: https://corpus-v2-0i2i.onrender.com
 paths:
   /answer:
     get:
-      operationId: answerJstageQuery
-      summary: Return candidate papers for a user query
+      operationId: answerJstage
+      summary: Get candidate papers for a query
       parameters:
         - in: query
           name: q
@@ -16,35 +16,5 @@ paths:
           schema:
             type: string
       responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  query:
-                    type: string
-                  candidates:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        title:
-                          type: string
-                        authors:
-                          type: array
-                          items:
-                            type: string
-                        journal:
-                          type: string
-                        year:
-                          type: string
-                        doi:
-                          type: string
-                        link:
-                          type: string
-                        abstract:
-                          type: string
-        '400':
-          description: Missing query
+        "200":
+          description: Candidate results
