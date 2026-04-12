@@ -9,7 +9,7 @@ servers:
 paths:
   /answer:
     get:
-      operationId: answerJstage
+      operationId: searchLawPsychPapers
       summary: Get candidate papers for a query
       parameters:
         - in: query
