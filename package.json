@@ -1,0 +1,15 @@
+{
+  "name": "jstage-render-minimal",
+  "version": "1.0.0",
+  "description": "Minimal Render proxy starter for a Custom GPT Action",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
