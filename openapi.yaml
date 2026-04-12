@@ -2,8 +2,10 @@ openapi: 3.1.0
 info:
   title: J-Stage Search Proxy
   version: 1.0.0
+
 servers:
   - url: https://corpus-v2-0i2i.onrender.com
+
 paths:
   /answer:
     get:
@@ -11,10 +13,49 @@ paths:
       summary: Get candidate papers for a query
       parameters:
         - in: query
-          name: q
+          name: query
           required: true
           schema:
             type: string
+          description: BM25向きに整形した検索語列
+        - in: query
+          name: user_query
+          required: true
+          schema:
+            type: string
+          description: ユーザーの原文クエリ
       responses:
         "200":
           description: Candidate results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  query:
+                    type: string
+                  user_query:
+                    type: string
+                  candidates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title:
+                          type: string
+                        authors:
+                          type: array
+                          items:
+                            type: string
+                        journal:
+                          type: string
+                        year:
+                          type: string
+                        doi:
+                          type: string
+                        link:
+                          type: string
+                        abstract:
+                          type: string
+                        score:
+                          type: number
