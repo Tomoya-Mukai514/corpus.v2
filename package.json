@@ -1,11 +1,4 @@
 {
-  "name": "jstage-render-minimal",
-  "version": "1.0.0",
-  "description": "Minimal J-STAGE proxy for Render",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
   "dependencies": {
     "express": "^4.21.2",
     "xml2js": "^0.6.2"
