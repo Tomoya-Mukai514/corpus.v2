@@ -150,13 +150,10 @@ app.get("/answer", async (req, res) => {
 
   const mergedRows = Array.from(aggregate.values()).map(finalizeMergedRow);
 
-  // 一次スコア
   let candidates = rankCandidatesWithBm25(mergedRows, query, userQuery);
 
-  // 一次スコア上位だけ抄録取得
   await enrichAbstractsForTopCandidates(candidates.slice(0, ABSTRACT_FETCH_TOP_N));
 
-  // 抄録取得後に再スコア
   candidates = rankCandidatesWithBm25(candidates, query, userQuery).slice(0, TOP_N);
 
   return res.json({
@@ -196,9 +193,11 @@ async function searchJstage(fieldName, term) {
 async function enrichAbstractsForTopCandidates(candidates) {
   for (let i = 0; i < candidates.length; i += ABSTRACT_FETCH_CONCURRENCY) {
     const batch = candidates.slice(i, i + ABSTRACT_FETCH_CONCURRENCY);
+
     await Promise.all(
       batch.map(async (candidate) => {
         if (!candidate.link || candidate.abstract) return;
+
         try {
           const abstract = await fetchAbstractFromArticleUrl(candidate.link);
           if (abstract) {
@@ -232,91 +231,135 @@ async function fetchAbstractFromArticleUrl(url) {
 function extractAbstractFromHtml(html) {
   const $ = cheerio.load(html);
 
-  // まず abstract 系セレクタを試す
-  const selectorCandidates = [
-    '[id*="abstract"]',
-    '[class*="abstract"]',
-    '[data-title*="抄録"]',
-    '[data-title*="Abstract"]'
+  $("script, style, noscript, template, svg").remove();
+
+  const exactSectionSelectors = [
+    "#article-overiew-abstract-wrap",
+    "#article-overview-abstract-wrap",
+    ".article-overiew-abstract-wrap",
+    ".article-overview-abstract-wrap",
+    "#article-overiew-abstract",
+    "#article-overview-abstract",
+    ".article-overiew-abstract",
+    ".article-overview-abstract"
   ];
 
-  for (const selector of selectorCandidates) {
+  for (const selector of exactSectionSelectors) {
+    const node = $(selector).first();
+    const text = extractAbstractFromSection($, node);
+    if (isValidAbstractText(text)) return text;
+  }
+
+  const broadSectionSelectors = [
+    '[id*="abstract"]',
+    '[class*="abstract"]'
+  ];
+
+  for (const selector of broadSectionSelectors) {
     const nodes = $(selector);
     for (let i = 0; i < nodes.length; i++) {
-      const text = cleanExtractedText($(nodes[i]).text());
+      const text = extractAbstractFromSection($, $(nodes[i]));
       if (isValidAbstractText(text)) return text;
     }
   }
 
-  // 見出し「抄録」「Abstract」から近傍テキストを拾う
   const headingTexts = ["抄録", "Abstract", "ABSTRACT"];
-  const headings = $("h1, h2, h3, h4, h5, h6, dt, strong, div, span, p");
+  const nodes = $("h1, h2, h3, h4, h5, h6, dt, strong, div, span, p, li, th");
 
-  for (let i = 0; i < headings.length; i++) {
-    const node = $(headings[i]);
+  for (let i = 0; i < nodes.length; i++) {
+    const node = $(nodes[i]);
     const label = cleanExtractedText(node.text());
+
     if (!headingTexts.includes(label)) continue;
 
-    // 次の兄弟要素
-    let collected = collectNearbyText($, node);
-    if (isValidAbstractText(collected)) return collected;
+    const text = collectAbstractAfterHeading($, node);
+    if (isValidAbstractText(text)) return text;
 
-    // 親要素付近
-    const parent = node.parent();
-    collected = collectNearbyText($, parent);
-    if (isValidAbstractText(collected)) return collected;
+    const parentText = extractAbstractFromSection($, node.parent());
+    if (isValidAbstractText(parentText)) return parentText;
   }
-
-  // ページ全体の素朴なテキスト抽出にフォールバック
-  const bodyText = cleanExtractedText($("body").text());
-  const abstractByRegex = extractAbstractByRegex(bodyText);
-  if (isValidAbstractText(abstractByRegex)) return abstractByRegex;
 
   return "";
 }
 
-function collectNearbyText($, node) {
-  const pieces = [];
+function extractAbstractFromSection($, node) {
+  if (!node || !node.length) return "";
 
-  let next = node.next();
+  const cloned = node.first().clone();
+  cloned.find("script, style, noscript, template, svg").remove();
+
+  let text = cleanExtractedText(cloned.text());
+  if (!text) return "";
+
+  text = text.replace(/^(抄録|Abstract)\s*/i, "");
+
+  const cut = text.match(
+    /^([\s\S]{40,4000}?)(?=(引用文献|関連文献|著者関連情報|キーワード|被引用文献|Keywords|References|Cited by|Author information|J-STAGE|この記事を共有|この記事に関連する情報)\b|$)/i
+  );
+
+  if (cut && cut[1]) {
+    text = cleanExtractedText(cut[1]);
+  }
+
+  if (isGarbageAbstractText(text)) return "";
+
+  return text;
+}
+
+function collectAbstractAfterHeading($, headingNode) {
+  const parts = [];
+
+  let cur = headingNode.next();
   let hops = 0;
-  while (next.length && hops < 6) {
-    const text = cleanExtractedText(next.text());
+
+  while (cur.length && hops < 8) {
+    const text = cleanExtractedText(cur.text());
+
     if (looksLikeSectionHeading(text)) break;
-    if (text) pieces.push(text);
-    next = next.next();
+    if (isGarbageAbstractText(text)) {
+      cur = cur.next();
+      hops += 1;
+      continue;
+    }
+
+    if (text) parts.push(text);
+
+    cur = cur.next();
     hops += 1;
   }
 
-  if (pieces.length) {
-    return cleanExtractedText(pieces.join(" "));
-  }
-
-  const blockText = cleanExtractedText(node.parent().text());
-  return extractAbstractByRegex(blockText);
-}
-
-function extractAbstractByRegex(text) {
-  if (!text) return "";
-
-  const patterns = [
-    /抄録\s*([\s\S]{80,2500}?)(?:引用文献|関連文献|図\s*\(\d+\)|著者関連情報|キーワード|©|前の記事|次の記事|被引用文献)/,
-    /Abstract\s*([\s\S]{80,2500}?)(?:References|Keywords|Cited by|Figures|Author information|©)/i
-  ];
-
-  for (const pattern of patterns) {
-    const m = text.match(pattern);
-    if (m && m[1]) {
-      return cleanExtractedText(m[1]);
-    }
+  if (parts.length > 0) {
+    return cleanExtractedText(parts.join(" "));
   }
 
   return "";
 }
 
+function isGarbageAbstractText(text) {
+  if (!text) return true;
+
+  return (
+    text.includes("offset().top") ||
+    text.includes("case '") ||
+    text.includes('case "') ||
+    text.includes("$('#") ||
+    text.includes("function(") ||
+    text.includes("function (") ||
+    text.includes("article-overiew-abstract-wrap") ||
+    text.includes("scrollTop") ||
+    text.includes("switch(") ||
+    text.includes("switch (") ||
+    text.includes("return false") ||
+    text.includes("window.") ||
+    text.includes("document.") ||
+    text.includes("addClass(")
+  );
+}
+
 function looksLikeSectionHeading(text) {
-  if (!text) return false;
-  return /^(抄録|Abstract|引用文献|関連文献|著者関連情報|キーワード|本文|詳細|被引用文献|図|References|Keywords)$/i.test(text);
+  return /^(抄録|Abstract|引用文献|関連文献|著者関連情報|キーワード|本文|詳細|被引用文献|図|References|Keywords|Author information|Cited by)$/i.test(
+    text || ""
+  );
 }
 
 function cleanExtractedText(text) {
@@ -330,6 +373,7 @@ function isValidAbstractText(text) {
   if (!text) return false;
   if (text.length < 80) return false;
   if (text.length > 4000) return false;
+  if (isGarbageAbstractText(text)) return false;
   return true;
 }
 
@@ -519,7 +563,7 @@ function rankCandidatesWithBm25(rows, query, userQuery) {
       const abstractBonus = doc._candidate.abstract ? 1.0 : 0.0;
 
       const score = Number(
-        (bm25Score + doc._candidate.field_bonus + bothFieldBonus + abstractBonus).toFixed(4)
+        (bm25Score + (doc._candidate.field_bonus || 0) + bothFieldBonus + abstractBonus).toFixed(4)
       );
 
       return {
@@ -626,7 +670,7 @@ function buildDocText(doc) {
 }
 
 function bm25Build(docs) {
-  const built = docs.map((doc, idx) => {
+  const built = docs.map((doc) => {
     const text = buildDocText(doc);
     const tokens = tokenize(text);
     const tf = new Map();
@@ -636,7 +680,6 @@ function bm25Build(docs) {
     }
 
     return {
-      idx,
       doc,
       tokens,
       tf,
