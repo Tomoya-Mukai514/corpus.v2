@@ -15,7 +15,6 @@ const SEARCH_FIELDS = [
 const MAX_TERMS = 8;
 const RESULTS_PER_SEARCH = 10;
 const TOP_N = 20;
-const ABSTRACT_FETCH_TOP_N = 10;
 const ABSTRACT_FETCH_CONCURRENCY = 3;
 
 const LOW_SIGNAL_QUERY_TERM_WEIGHTS = new Map([
@@ -152,7 +151,8 @@ app.get("/answer", async (req, res) => {
 
   let candidates = rankCandidatesWithBm25(mergedRows, query, userQuery);
 
-  await enrichAbstractsForTopCandidates(candidates.slice(0, ABSTRACT_FETCH_TOP_N));
+  // 一次順位に関係なく、取得できた候補すべてに対して抄録取得を試す
+  await enrichAbstractsForCandidates(candidates);
 
   candidates = rankCandidatesWithBm25(candidates, query, userQuery).slice(0, TOP_N);
 
@@ -190,7 +190,7 @@ async function searchJstage(fieldName, term) {
   return await response.text();
 }
 
-async function enrichAbstractsForTopCandidates(candidates) {
+async function enrichAbstractsForCandidates(candidates) {
   for (let i = 0; i < candidates.length; i += ABSTRACT_FETCH_CONCURRENCY) {
     const batch = candidates.slice(i, i + ABSTRACT_FETCH_CONCURRENCY);
 
