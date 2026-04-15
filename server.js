@@ -1,6 +1,7 @@
 const express = require("express");
 const xml2js = require("xml2js");
 const cheerio = require("cheerio");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -78,10 +79,32 @@ app.get("/", (req, res) => {
 });
 
 app.get("/answer", async (req, res) => {
+  const startedAt = Date.now();
+  const requestId = crypto.randomUUID();
+
   const query = String(req.query.query || "").trim();
   const userQuery = String(req.query.user_query || "").trim();
 
+  const baseLog = buildRequestLog(req, {
+    type: "search",
+    request_id: requestId,
+    query,
+    user_query: userQuery
+  });
+
+  logInfo({
+    ...baseLog,
+    stage: "received"
+  });
+
   if (!query) {
+    logInfo({
+      ...baseLog,
+      stage: "rejected",
+      reason: "missing_query",
+      duration_ms: Date.now() - startedAt
+    });
+
     return res.status(400).json({
       error: "Missing required query parameter: query"
     });
@@ -90,6 +113,14 @@ app.get("/answer", async (req, res) => {
   const terms = buildTerms(query);
 
   if (terms.length === 0) {
+    logInfo({
+      ...baseLog,
+      stage: "completed",
+      terms_count: 0,
+      results_count: 0,
+      duration_ms: Date.now() - startedAt
+    });
+
     return res.json({
       query,
       user_query: userQuery,
@@ -101,69 +132,138 @@ app.get("/answer", async (req, res) => {
   let successCalls = 0;
   const errors = [];
 
-  for (const term of terms) {
-    for (const field of SEARCH_FIELDS) {
-      try {
-        const xml = await searchJstage(field.name, term);
-        const parsed = await xml2js.parseStringPromise(xml, {
-          explicitArray: false,
-          mergeAttrs: true,
-          trim: true
-        });
+  try {
+    for (const term of terms) {
+      for (const field of SEARCH_FIELDS) {
+        try {
+          const xml = await searchJstage(field.name, term, {
+            requestId,
+            originalQuery: query,
+            userQuery
+          });
 
-        const feed = parsed.feed || {};
-        const result = feed.result || {};
-        const status = pickText(result.status) || "0";
-        const message = pickText(result.message) || "";
+          const parsed = await xml2js.parseStringPromise(xml, {
+            explicitArray: false,
+            mergeAttrs: true,
+            trim: true
+          });
 
-        if (status === "ERR_001") {
-          continue;
+          const feed = parsed.feed || {};
+          const result = feed.result || {};
+          const status = pickText(result.status) || "0";
+          const message = pickText(result.message) || "";
+
+          if (status === "ERR_001") {
+            logInfo({
+              ...baseLog,
+              stage: "jstage_empty",
+              field: field.name,
+              term,
+              jstage_status: status,
+              jstage_message: message
+            });
+            continue;
+          }
+
+          if (status !== "0") {
+            errors.push(`${field.name}:${term}:${status}:${message}`);
+            logError({
+              ...baseLog,
+              stage: "jstage_error",
+              field: field.name,
+              term,
+              jstage_status: status,
+              jstage_message: message
+            });
+            continue;
+          }
+
+          successCalls += 1;
+
+          const entries = normalizeToArray(feed.entry);
+          for (const entry of entries) {
+            const candidate = mapEntryToCandidate(entry);
+            if (!candidate.title && !candidate.link && !candidate.doi) continue;
+            mergeCandidate(aggregate, candidate, term, field.name, field.bonus);
+          }
+        } catch (error) {
+          console.error(`Search failed [${field.name}] ${term}:`, error);
+          errors.push(`${field.name}:${term}:${error.message}`);
+
+          logError({
+            ...baseLog,
+            stage: "jstage_fetch_failed",
+            field: field.name,
+            term,
+            error: error.message
+          });
         }
-
-        if (status !== "0") {
-          errors.push(`${field.name}:${term}:${status}:${message}`);
-          continue;
-        }
-
-        successCalls += 1;
-
-        const entries = normalizeToArray(feed.entry);
-        for (const entry of entries) {
-          const candidate = mapEntryToCandidate(entry);
-          if (!candidate.title && !candidate.link && !candidate.doi) continue;
-          mergeCandidate(aggregate, candidate, term, field.name, field.bonus);
-        }
-      } catch (error) {
-        console.error(`Search failed [${field.name}] ${term}:`, error);
-        errors.push(`${field.name}:${term}:${error.message}`);
       }
     }
-  }
 
-  if (aggregate.size === 0 && successCalls === 0 && errors.length > 0) {
-    return res.status(502).json({
-      error: "Failed to fetch results from J-STAGE",
-      detail: errors
+    if (aggregate.size === 0 && successCalls === 0 && errors.length > 0) {
+      logError({
+        ...baseLog,
+        stage: "failed",
+        reason: "all_jstage_calls_failed",
+        errors,
+        duration_ms: Date.now() - startedAt
+      });
+
+      return res.status(502).json({
+        error: "Failed to fetch results from J-STAGE",
+        detail: errors
+      });
+    }
+
+    const mergedRows = Array.from(aggregate.values()).map(finalizeMergedRow);
+
+    let candidates = rankCandidatesWithBm25(mergedRows, query, userQuery);
+
+    // 一次順位に関係なく、取得できた候補すべてに対して抄録取得を試す
+    await enrichAbstractsForCandidates(candidates, {
+      requestId,
+      query,
+      userQuery,
+      req
+    });
+
+    candidates = rankCandidatesWithBm25(candidates, query, userQuery).slice(0, TOP_N);
+
+    logInfo({
+      ...baseLog,
+      stage: "completed",
+      terms_count: terms.length,
+      success_calls: successCalls,
+      error_count: errors.length,
+      aggregate_count: aggregate.size,
+      results_count: candidates.length,
+      duration_ms: Date.now() - startedAt
+    });
+
+    return res.json({
+      query,
+      user_query: userQuery,
+      candidates
+    });
+  } catch (error) {
+    logError({
+      ...baseLog,
+      stage: "failed",
+      reason: "unhandled_exception",
+      error: error.message,
+      duration_ms: Date.now() - startedAt
+    });
+
+    console.error("Unhandled /answer error:", error);
+
+    return res.status(500).json({
+      error: "Internal server error"
     });
   }
-
-  const mergedRows = Array.from(aggregate.values()).map(finalizeMergedRow);
-
-  let candidates = rankCandidatesWithBm25(mergedRows, query, userQuery);
-
-  // 一次順位に関係なく、取得できた候補すべてに対して抄録取得を試す
-  await enrichAbstractsForCandidates(candidates);
-
-  candidates = rankCandidatesWithBm25(candidates, query, userQuery).slice(0, TOP_N);
-
-  return res.json({
-    query,
-    user_query: userQuery,
-    candidates
-  });
 });
 
-async function searchJstage(fieldName, term) {
+async function searchJstage(fieldName, term, meta = {}) {
   const params = new URLSearchParams({
     service: "3",
     [fieldName]: term,
@@ -173,7 +273,17 @@ async function searchJstage(fieldName, term) {
   });
 
   const url = `${JSTAGE_API_URL}?${params.toString()}`;
-  console.log(`[J-STAGE] ${fieldName}: ${term} -> ${url}`);
+
+  logInfo({
+    type: "jstage_request",
+    at: new Date().toISOString(),
+    request_id: meta.requestId || "",
+    field: fieldName,
+    term,
+    original_query: meta.originalQuery || "",
+    user_query: meta.userQuery || "",
+    url
+  });
 
   const response = await fetch(url, {
     method: "GET",
@@ -190,7 +300,7 @@ async function searchJstage(fieldName, term) {
   return await response.text();
 }
 
-async function enrichAbstractsForCandidates(candidates) {
+async function enrichAbstractsForCandidates(candidates, meta = {}) {
   for (let i = 0; i < candidates.length; i += ABSTRACT_FETCH_CONCURRENCY) {
     const batch = candidates.slice(i, i + ABSTRACT_FETCH_CONCURRENCY);
 
@@ -205,6 +315,19 @@ async function enrichAbstractsForCandidates(candidates) {
           }
         } catch (error) {
           console.error(`Abstract fetch failed: ${candidate.link}`, error.message);
+
+          logError({
+            ...buildRequestLog(meta.req, {
+              type: "abstract_fetch_failed",
+              request_id: meta.requestId || "",
+              query: meta.query || "",
+              user_query: meta.userQuery || ""
+            }),
+            stage: "abstract_fetch_failed",
+            article_link: candidate.link,
+            title: candidate.title || "",
+            error: error.message
+          });
         }
       })
     );
@@ -843,6 +966,37 @@ function intersectionSize(setA, setB) {
     if (setB.has(v)) count += 1;
   }
   return count;
+}
+
+function buildRequestLog(req, extra = {}) {
+  const forwardedFor = req?.headers?.["x-forwarded-for"];
+  const ip =
+    typeof forwardedFor === "string"
+      ? forwardedFor.split(",")[0].trim()
+      : req?.socket?.remoteAddress || "";
+
+  return {
+    at: new Date().toISOString(),
+    method: req?.method || "",
+    path: req?.path || "",
+    ip,
+    user_agent: req?.headers?.["user-agent"] || "",
+    ...extra
+  };
+}
+
+function logInfo(payload) {
+  console.log(JSON.stringify({
+    level: "info",
+    ...payload
+  }));
+}
+
+function logError(payload) {
+  console.error(JSON.stringify({
+    level: "error",
+    ...payload
+  }));
 }
 
 app.listen(PORT, "0.0.0.0", () => {
